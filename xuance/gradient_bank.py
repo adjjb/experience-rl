@@ -178,7 +178,7 @@ class OTExperienceBank:
 
     def get_ot_mapping(self, state, current_mean, current_std, iterations):
         """获取最优传输映射（修复维度问题）"""
-        Beta = min(1 - 1/94000* iterations, 0.1)
+        Beta = max(1 - 1/94000* iterations, 0.1)
 
         if len(self.states) == 0:
             return None
