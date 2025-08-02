@@ -272,3 +272,49 @@ class OTExperienceBank:
         P = u * K * v.t()  # [n_samples, n_samples]
         
         return P
+
+# 1. 计算状态相似度（使用马氏距离）
+    state_np = state.detach().cpu().numpy().flatten().astype(np.float32)
+    states = np.array(self.states, dtype=np.float32)
+    
+    # 计算状态协方差矩阵
+    cov_matrix = np.cov(states.T) + 1e-6 * np.eye(states.shape[1])
+    inv_cov = np.linalg.inv(cov_matrix)
+    
+    # 计算马氏距离
+    diff = states - state_np
+    dists = np.sqrt(np.sum(diff @ inv_cov * diff, axis=1))
+    
+    # 2. 动态选择k值
+    k = min(10, max(3, int(len(self.states)**0.5)))  # 基于经验库大小的平方根
+    
+    # 3. 选择top-k索引
+    topk_idxs = np.argsort(dists)[:k] if len(dists) > 0 else []
+    
+    if len(topk_idxs) == 0:
+        return None
+    
+    # 4. 基于最优传输理论的权重计算
+    topk_dists = dists[topk_idxs]
+    
+    # 计算权重基值（使用指数衰减）
+    base_weights = np.exp(-topk_dists / np.median(topk_dists))
+    
+    # 5. 基于迭代次数的调整
+    # 训练初期更依赖历史，后期更依赖当前策略
+    history_weight = max(0.3, 1.0 - min(0.7, iterations/50000))
+    
+    # 6. 基于KL散度的质量评估
+    kl_weights = []
+    for i in topk_idxs:
+        hist_dist = torch.distributions.Normal(
+            torch.tensor(self.means[i], device=self.device),
+            torch.tensor(self.stds[i], device=self.device)
+        )
+        kl_div = torch.distributions.kl_divergence(hist_dist, current_dist).mean().item()
+        kl_weights.append(np.exp(-kl_div))
+    
+    # 7. 组合权重
+    combined_weights = base_weights * np.array(kl_weights) * history_weight
+    weights = torch.tensor(combined_weights / combined_weights.sum(), 
+                          dtype=torch.float32, device=self.device)
