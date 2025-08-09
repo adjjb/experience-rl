@@ -170,3 +170,133 @@ class StateCategorizer:
     #             return
     #         self.mukappa[category, 1] = (1 - Beta) * self.mukappa[category, 1] + 1
     #         self.mukappa[category, 0] = self.mukappa[category, 0] * (1 - Beta) + Beta * Q.detach()
+
+
+
+
+class PPOCLIP_Learner(Learner):
+    def __init__(self,
+                 policy: nn.Module,
+                 optimizer: torch.optim.Optimizer,
+                 scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+                 device: Optional[Union[int, str, torch.device]] = None,
+                 model_dir: str = "./",
+                 vf_coef: float = 0.25,
+                 ent_coef: float = 0.005,
+                 clip_range: float = 0.25,
+                 clip_grad_norm: float = 0.25,
+                 use_grad_clip: bool = True,
+                 use_grad_bank: bool = False,
+                 ot_bank_capacity: int = 1000,
+                 ot_update_freq: int = 15,
+                 dist_type: str = "Categorical_AC",
+                 group_size: int = 4):  # 新增分组大小参数
+        super(PPOCLIP_Learner, self).__init__(policy, optimizer, scheduler, device, model_dir)
+
+        # ... [其他初始化代码不变] ...
+        self.group_size = group_size  # 每组处理的样本数
+
+    def update(self, obs_batch, act_batch, ret_batch, value_batch, adv_batch, old_logp):
+        self.iterations += 1
+        # ... [张量转换和策略输出获取不变] ...
+        
+        # OT分布对齐
+        if self.use_grad_bank:
+            # 计算平均状态用于经验检索
+            avg_state = outputs['state'].mean(dim=0, keepdim=True).to(torch.float32)
+            
+            update_ot = (self.iterations % self.ot_update_freq == 0)
+            update_bank = (self.iterations % (self.ot_update_freq * 5) == 0)
+            
+            batch_size = outputs['state'].shape[0]
+            
+            # 初始化对齐后的参数容器
+            if self.is_discrete:
+                aligned_logits = torch.zeros_like(a_dist.logits)
+            else:
+                mean, std = a_dist.get_param()
+                aligned_means = torch.zeros_like(mean)
+                aligned_stds = torch.zeros_like(std)
+            
+            # 分组处理OT映射
+            if update_ot:
+                # 计算需要处理的组数
+                num_groups = (batch_size + self.group_size - 1) // self.group_size
+                
+                for group_idx in range(num_groups):
+                    # 确定当前组的索引范围
+                    start_idx = group_idx * self.group_size
+                    end_idx = min((group_idx + 1) * self.group_size, batch_size)
+                    
+                    # 选择组内代表性样本（中间位置）
+                    rep_idx = start_idx + (end_idx - start_idx) // 2
+                    
+                    # 获取代表性样本的分布参数
+                    if self.is_discrete:
+                        current_params = a_dist.logits[rep_idx].detach()
+                    else:
+                        mean, std = a_dist.get_param()
+                        current_params = (mean[rep_idx], std[rep_idx])
+                    
+                    # 获取OT映射
+                    transport_map = self.ot_bank.get_ot_mapping(
+                        state=avg_state,
+                        current_params=current_params,
+                        iterations=self.iterations
+                    )
+                    
+                    if transport_map is not None:
+                        # 应用OT映射到代表性样本
+                        aligned_params = self.ot_bank.apply_ot_mapping(current_params, transport_map)
+                        
+                        # 将结果应用到整个组
+                        for i in range(start_idx, end_idx):
+                            if self.is_discrete:
+                                aligned_logits[i] = aligned_params
+                            else:
+                                aligned_means[i] = aligned_params[0]
+                                aligned_stds[i] = aligned_params[1]
+                    else:
+                        # 没有OT映射时使用原始参数
+                        for i in range(start_idx, end_idx):
+                            if self.is_discrete:
+                                aligned_logits[i] = a_dist.logits[i]
+                            else:
+                                mean, std = a_dist.get_param()
+                                aligned_means[i] = mean[i]
+                                aligned_stds[i] = std[i]
+                
+                # 应用对齐后的参数到分布
+                if self.is_discrete:
+                    a_dist.set_param(logits=aligned_logits)
+                else:
+                    a_dist.set_param(aligned_means, aligned_stds)
+            
+            # 更新经验银行
+            if update_bank:
+                # 从每个组中随机选择一个样本更新经验银行
+                num_groups = (batch_size + self.group_size - 1) // self.group_size
+                group_rep_indices = []
+                
+                for group_idx in range(num_groups):
+                    start_idx = group_idx * self.group_size
+                    end_idx = min((group_idx + 1) * self.group_size, batch_size)
+                    
+                    # 随机选择组内一个样本
+                    rep_idx = torch.randint(start_idx, end_idx, (1,)).item()
+                    group_rep_indices.append(rep_idx)
+                    
+                    rep_state = outputs['state'][rep_idx].unsqueeze(0)
+                    
+                    if self.is_discrete:
+                        rep_params = a_dist.logits[rep_idx].detach()
+                    else:
+                        mean, std = a_dist.get_param()
+                        rep_params = (mean[rep_idx].detach(), std[rep_idx].detach())
+                    
+                    self.ot_bank.update(
+                        state=rep_state,
+                        dist_params=rep_params
+                    )
+        
+        # ... [PPO损失计算和优化步骤不变] ...
