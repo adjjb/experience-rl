@@ -1,6 +1,6 @@
 dl_toolbox: "torchAgent"  # The deep learning toolbox. Choices: "torchAgent", "mindspore", "tensorflow"
 
-project_name: "experience_ppo"
+project_name: "experience_ppo_atari"
 # logger: "wandb"  # Choices: "tensorboard", "wandb".
 
 logger: "wandb"
