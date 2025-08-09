@@ -193,9 +193,9 @@ class PPOCLIP_Learner(Learner):
                  use_grad_clip: bool = True,
                  use_grad_bank: bool = False,
                  ot_bank_capacity: int = 1000,
-                 ot_update_freq: int = 15):
-        
-        super(UnifiedPPOCLIP_Learner, self).__init__(policy, optimizer, scheduler, device, model_dir)
+                 ot_update_freq: int = 15,
+                 dist_type: str = "Categorical_AC"):
+        super(PPOCLIP_Learner, self).__init__(policy, optimizer, scheduler, device, model_dir)
 
         self.vf_coef = vf_coef
         self.ent_coef = ent_coef
@@ -205,16 +205,17 @@ class PPOCLIP_Learner(Learner):
         self.use_grad_bank = use_grad_bank
         self.ot_update_freq = ot_update_freq
         self.last_kl = 0.0
-        
+        self.dist_type = dist_type
+        self.is_discrete = True if self.dist_type == 'Categorical_AC' else False
         if self.use_grad_bank:
             state_dim = policy.representation.output_shapes['state'][0]
             action_dim = policy.action_dim
-            dist_type = 'categorical' if self.policy == 'Categorical_AC' else 'gaussian'
-            
+            dtype = 'categorical' if self.dist_type == 'Categorical_AC' else 'gaussian'
+
             self.ot_bank = OTExperienceBank(
                 state_dim=state_dim,
                 action_dim=action_dim,
-                dist_type=dist_type,
+                dist_type=dtype,
                 device=device,
                 capacity=ot_bank_capacity
             )
@@ -236,7 +237,7 @@ class PPOCLIP_Learner(Learner):
         # 根据离散/连续类型获取分布参数
         if self.is_discrete:
             # 离散动作空间
-            dist_params = a_dist.logits[0]  # 取第一个样本的logits
+            dist_params = a_dist.get_param()[0]  # 取第一个样本的logits
         else:
             # 连续动作空间
             mean, std = a_dist.get_param()
@@ -247,20 +248,21 @@ class PPOCLIP_Learner(Learner):
             # 使用优势最大的状态作为代表
             rep_idx = torch.argmax(torch.abs(adv_batch))
             rep_state = outputs['state'][rep_idx].unsqueeze(0)
-            
-            # 计算策略变化（KL散度）
-            with torch.no_grad():
-                _, old_a_dist, _ = self.policy(obs_batch)
-                kl_div = torch.distributions.kl_divergence(a_dist, old_a_dist).mean().item()
-                self.last_kl = 0.9 * self.last_kl + 0.1 * kl_div
+            avg_state = outputs['state'].mean(dim=0, keepdim=True).to(torch.float32)
+            # # 计算策略变化（KL散度）
+            # with torch.no_grad():
+            #     _, old_a_dist, _ = self.policy(obs_batch)
+            #     kl_div = torch.distributions.kl_divergence(a_dist, old_a_dist).mean().item()
+            #     self.last_kl = 0.9 * self.last_kl + 0.1 * kl_div
             
             # 动态更新条件
-            update_ot = (self.last_kl > 0.05) or (self.iterations % self.ot_update_freq == 0)
-            update_bank = (self.last_kl > 0.1) or (self.iterations % (self.ot_update_freq * 2) == 0)
-            
+            # update_ot = (self.last_kl > 0.05) or (self.iterations % self.ot_update_freq == 0)
+            # update_bank = (self.last_kl > 0.1) or (self.iterations % (self.ot_update_freq * 5) == 0)
+            update_ot = (self.iterations % self.ot_update_freq == 0)
+            update_bank = (self.iterations % (self.ot_update_freq * 5) == 0)
             if update_ot:
                 transport_map = self.ot_bank.get_ot_mapping(
-                    state=rep_state,
+                    state=avg_state,
                     current_params=dist_params,
                     iterations=self.iterations
                 )
@@ -284,13 +286,15 @@ class PPOCLIP_Learner(Learner):
                     rep_params = a_dist.logits[rep_idx].detach()
                 else:
                     # 连续：存储(mean, std)
-                    rep_mean, rep_std = a_dist.get_param()
-                    rep_mean = rep_mean[rep_idx].detach()
-                    rep_std = rep_std[rep_idx].detach()
-                    rep_params = (rep_mean, rep_std)
+                    # rep_mean, rep_std = a_dist.get_param()
+                    # rep_mean = rep_mean[rep_idx].detach()
+                    # rep_std = rep_std[rep_idx].detach()
+                    # rep_params = (rep_mean, rep_std)
+                    rep_params = dist_params
+
                 
                 self.ot_bank.update(
-                    state=rep_state,
+                    state=avg_state,
                     dist_params=rep_params
                 )
         
@@ -325,8 +329,8 @@ class PPOCLIP_Learner(Learner):
             "entropy": e_loss.item(),
             "learning_rate": lr,
             "predict_value": v_pred.mean().item(),
-            "clip_ratio": cr.item(),
-            "kl_divergence": self.last_kl
+            "clip_ratio": cr.item()
+            # "kl_divergence": self.last_kl
         }
         
         return info
