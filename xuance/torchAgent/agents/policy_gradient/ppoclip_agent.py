@@ -36,6 +36,7 @@ class PPOCLIP_Agent(Agent):
         self.action_space = envs.action_space
         self.auxiliary_info_shape = {"old_logp": ()}
         print(self.action_space)
+        # print(config.policy)
         self.atari = True if config.env_name == "Atari" else False
         Buffer = DummyOnPolicyBuffer_Atari if self.atari else DummyOnPolicyBuffer
         self.buffer_size = self.n_envs * self.horizon_size
@@ -72,7 +73,11 @@ class PPOCLIP_Agent(Agent):
             use_grad_clip=config.use_grad_clip,
             use_grad_bank=config.use_grad_bank,
             ot_bank_capacity=config.ot_bank_capacity,
-            ot_update_freq=config.ot_update_freq
+            ot_update_freq=config.ot_update_freq,
+            dist_type=config.policy,
+            group_size=config.group_size,
+            delay_constant=config.delay_constant,
+            n_samples=config.n_samples
         )
         super(PPOCLIP_Agent, self).__init__(config, envs, policy, memory, learner, device,
                                             config.log_dir, config.model_dir)
