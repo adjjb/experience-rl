@@ -194,7 +194,10 @@ class PPOCLIP_Learner(Learner):
                  use_grad_bank: bool = False,
                  ot_bank_capacity: int = 1000,
                  ot_update_freq: int = 15,
-                 dist_type: str = "Categorical_AC"):
+                 dist_type: str = "Categorical_AC",
+                 group_size: int = 4,
+                 delay_constant: int = 5,
+                 n_samples: int = 50):
         super(PPOCLIP_Learner, self).__init__(policy, optimizer, scheduler, device, model_dir)
 
         self.vf_coef = vf_coef
@@ -204,9 +207,14 @@ class PPOCLIP_Learner(Learner):
         self.use_grad_clip = use_grad_clip
         self.use_grad_bank = use_grad_bank
         self.ot_update_freq = ot_update_freq
-        self.last_kl = 0.0
+        self.ot_bank_update_freq = self.ot_update_freq * delay_constant
+
         self.dist_type = dist_type
+        print(self.dist_type)
         self.is_discrete = True if self.dist_type == 'Categorical_AC' else False
+        self.group_size = group_size
+        
+
         if self.use_grad_bank:
             state_dim = policy.representation.output_shapes['state'][0]
             action_dim = policy.action_dim
@@ -217,7 +225,8 @@ class PPOCLIP_Learner(Learner):
                 action_dim=action_dim,
                 dist_type=dtype,
                 device=device,
-                capacity=ot_bank_capacity
+                capacity=ot_bank_capacity,
+                n_samples=n_samples
             )
 
     def update(self, obs_batch, act_batch, ret_batch, value_batch, adv_batch, old_logp):
@@ -229,22 +238,26 @@ class PPOCLIP_Learner(Learner):
         value_batch = torch.as_tensor(value_batch, device=self.device, dtype=torch.float32)
         adv_batch = torch.as_tensor(adv_batch, device=self.device, dtype=torch.float32)
         old_logp_batch = torch.as_tensor(old_logp, device=self.device, dtype=torch.float32)
-        obs_batch = torch.as_tensor(obs_batch, device=self.device, dtype=torch.float32)
+        # obs_batch = torch.as_tensor(obs_batch, device=self.device, dtype=torch.float32)
 
         # 获取策略输出
         outputs, a_dist, v_pred = self.policy(obs_batch)
-        
-        # 根据离散/连续类型获取分布参数
-        if self.is_discrete:
-            # 离散动作空间
-            dist_params = a_dist.get_param()[0]  # 取第一个样本的logits
-        else:
-            # 连续动作空间
-            mean, std = a_dist.get_param()
-            dist_params = (mean, std)
+
+        batch_size = outputs['state'].shape[0]
         
         # OT分布对齐
         if self.use_grad_bank:
+            num_groups = (batch_size + self.group_size - 1) // self.group_size
+            # 根据离散/连续类型获取分布参数
+            if self.is_discrete:
+                # 离散动作空间
+                # dist_params = a_dist.get_param()[0]  # 取第一个样本的logits
+                aligned_logits = torch.zeros_like(a_dist.logits)
+            else:
+                # 连续动作空间
+                mean, std = a_dist.get_param()
+                dist_params = (mean, std)
+            
             # 使用优势最大的状态作为代表
             rep_idx = torch.argmax(torch.abs(adv_batch))
             rep_state = outputs['state'][rep_idx].unsqueeze(0)
@@ -259,42 +272,76 @@ class PPOCLIP_Learner(Learner):
             # update_ot = (self.last_kl > 0.05) or (self.iterations % self.ot_update_freq == 0)
             # update_bank = (self.last_kl > 0.1) or (self.iterations % (self.ot_update_freq * 5) == 0)
             update_ot = (self.iterations % self.ot_update_freq == 0)
-            update_bank = (self.iterations % (self.ot_update_freq * 5) == 0)
+            update_bank = (self.iterations % self.ot_bank_update_freq == 0)
+
+            if self.is_discrete:
+                
+                for group_idx in range(num_groups):
+                    # 确定当前组的索引范围
+                    start_idx = group_idx * self.group_size
+                    end_idx = min((group_idx + 1) * self.group_size, batch_size)
+                    
+                    # 选择组内代表性样本（中间位置）
+                    rep_idx = start_idx + (end_idx - start_idx) // 2
+                
+                current_params = a_dist.logits[rep_idx].detach()
+            else:
+                current_params = dist_params
+
             if update_ot:
                 transport_map = self.ot_bank.get_ot_mapping(
                     state=avg_state,
-                    current_params=dist_params,
+                    current_params=current_params,
                     iterations=self.iterations
                 )
                 
                 if transport_map is not None:
-                    aligned_params = self.ot_bank.apply_ot_mapping(dist_params, transport_map)
+                    aligned_params = self.ot_bank.apply_ot_mapping(current_params, transport_map)
                     
                     # 应用对齐后的参数
                     if self.is_discrete:
+                        for i in range(start_idx, end_idx):
                         # 离散：对齐的是logits
-                        a_dist.set_param(logits=aligned_params.unsqueeze(0).expand_as(a_dist.logits))
+                        # a_dist.set_param(logits=aligned_params.unsqueeze(0).expand_as(a_dist.logits))
+                            aligned_logits[i] = aligned_params
+                        a_dist.set_param(logits=aligned_logits)
                     else:
                         # 连续：对齐的是(mean, std)
                         aligned_mean, aligned_std = aligned_params
                         a_dist.set_param(aligned_mean, aligned_std)
             
             if update_bank:
-                # 使用代表性状态更新经验银行
+                # # 使用代表性状态更新经验银行
+                # if self.is_discrete:
+                #     # 离散：存储logits
+                #     rep_params = a_dist.logits[rep_idx].detach()
+                # else:
+                #     # 连续：存储(mean, std)
+                #     # rep_mean, rep_std = a_dist.get_param()
+                #     # rep_mean = rep_mean[rep_idx].detach()
+                #     # rep_std = rep_std[rep_idx].detach()
+                #     # rep_params = (rep_mean, rep_std)
+                #     rep_params = dist_params
+                group_rep_indices = []
+                    
                 if self.is_discrete:
-                    # 离散：存储logits
-                    rep_params = a_dist.logits[rep_idx].detach()
-                else:
-                    # 连续：存储(mean, std)
-                    # rep_mean, rep_std = a_dist.get_param()
-                    # rep_mean = rep_mean[rep_idx].detach()
-                    # rep_std = rep_std[rep_idx].detach()
-                    # rep_params = (rep_mean, rep_std)
-                    rep_params = dist_params
+                    for group_idx in range(num_groups):
+                        start_idx = group_idx * self.group_size
+                        end_idx = min((group_idx + 1) * self.group_size, batch_size)
+                        
+                        # 随机选择组内一个样本
+                        rep_idx = torch.randint(start_idx, end_idx, (1,)).item()
+                        group_rep_indices.append(rep_idx)
+                        
+                        rep_state = outputs['state'][rep_idx].unsqueeze(0)
 
+                        rep_params = a_dist.logits[rep_idx].detach()
+                else:
+                    rep_state = avg_state
+                    rep_params = dist_params
                 
                 self.ot_bank.update(
-                    state=avg_state,
+                    state=rep_state,
                     dist_params=rep_params
                 )
         
