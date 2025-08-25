@@ -322,7 +322,7 @@ class GradientBank(nn.Module):
 class OTExperienceBank:
     """统一的最优传输经验银行，支持连续和离散动作空间"""
     def __init__(self, state_dim, action_dim, dist_type, device, 
-                 capacity=1000, sinkhorn_reg=0.1):
+                 capacity=1000, sinkhorn_reg=0.1,n_samples=50):
         """
         dist_type: 'gaussian' 或 'categorical'
         """
@@ -332,6 +332,7 @@ class OTExperienceBank:
         self.device = device
         self.capacity = capacity
         self.sinkhorn_reg = sinkhorn_reg
+        self.n_samples = n_samples
         
         # 经验存储
         self.states = deque(maxlen=capacity)
@@ -440,17 +441,19 @@ class OTExperienceBank:
         # 计算最优传输
         return self._compute_ot_mapping(current_dist, hist_dist)
     
-    def _compute_ot_mapping_gaussian(self, source_dist, target_dist, n_samples=50):
+    def _compute_ot_mapping_gaussian(self, source_dist, target_dist):
         """计算最优传输映射（修复维度问题）"""
+        n_samples = self.n_samples
         # 从两个分布采样并确保float32
         source_samples = source_dist.rsample((n_samples,)).to(torch.float32)
         target_samples = target_dist.rsample((n_samples,)).to(torch.float32)
-        
+        print(n_samples)
         # 重塑样本为二维矩阵 [n_samples, d]
         d = source_samples.shape[-1]
         source_samples = source_samples.reshape(n_samples, -1)
         target_samples = target_samples.reshape(n_samples, -1)
-        
+        print(source_samples.shape)
+        print(target_samples.shape)
         # 计算成本矩阵
         C = torch.cdist(source_samples, target_samples, p=2)  # [n_samples, n_samples]
         
@@ -498,7 +501,7 @@ class OTExperienceBank:
     
     def _apply_ot_mapping_gaussian(self, current_params, transport_map):
         """应用OT映射到高斯分布参数"""
-        n_samples = 50
+        n_samples = self.n_samples
         mean, std = current_params
         # 创建分布
         dist = torch.distributions.Normal(mean, std)
